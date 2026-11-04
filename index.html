@@ -110,7 +110,7 @@ button,input,select{ font:inherit; color:inherit; }
 .kpis{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
 .kpis-3{ grid-template-columns:repeat(3,minmax(0,1fr)); }
 .kpi{ border-radius:12px; position:relative; padding:16px 18px; display:flex; flex-direction:column; gap:6px; min-width:0; }
-.kpi .label{ font-size:10.5px; color:var(--muted); letter-spacing:.12em; }
+.kpi .label{ font-size:10.5px; color:var(--muted); letter-spacing:.12em; display:flex; align-items:center; gap:2px; white-space:nowrap; }
 .kpi .value{ font-size:24px; font-weight:500; line-height:1.15; letter-spacing:-.02em; overflow-wrap:anywhere; }
 .delta{ display:inline-flex; align-items:center; gap:7px; font-size:12px; flex-wrap:wrap; }
 .chg{ font-family:var(--mono); font-weight:600; font-size:11.5px; }
@@ -344,6 +344,7 @@ footer{ display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px; fo
 .kpi-saldo[data-level="baixo"] #saldo-dias{ color:var(--warn); }
 .load-err{ background:var(--card); border:1px solid var(--line-2); border-radius:var(--r); padding:18px 20px; color:var(--ink-soft); }
 .eng-empty{ color:var(--muted); font-size:13px; margin:0; }
+.ads-empty{ grid-column:1/-1; margin:0; padding:6px 2px; }
 </style>
 </head>
 <body>
@@ -429,7 +430,7 @@ footer{ display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px; fo
 
     <section class="card" id="ads">
       <div class="card-h"><span class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M10 9l5 2.5-5 2.5z"/><path d="M8 21h8"/></svg></span>
-        <div><h2>Anúncios que mais trouxeram leads</h2><span class="card-sub">Últimos 7 dias · o mesmo anúncio em públicos diferentes aparece somado</span></div></div>
+        <div><h2 id="ads-h">Anúncios que mais trouxeram leads</h2><span class="card-sub" id="ads-sub">Últimos 7 dias · o mesmo anúncio em públicos diferentes aparece somado</span></div></div>
       <div class="ads-grid" id="ads-grid"></div>
     </section>
 
@@ -478,6 +479,11 @@ footer{ display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px; fo
           <div class="card-h"><span class="ico"><svg viewBox="0 0 24 24"><path d="M4 16l5-5 4 4 7-7"/><path d="M14 8h6v6"/></svg></span>
             <div><h2>Leads por dia</h2><span class="card-sub" id="pd-chart-sub"></span></div></div>
           <svg id="pd-chart" class="chart" role="img" aria-label="Leads por dia do empreendimento"></svg>
+        </section>
+        <section class="card">
+          <div class="card-h"><span class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M10 9l5 2.5-5 2.5z"/><path d="M8 21h8"/></svg></span>
+            <div><h2>Criativos que mais converteram</h2><span class="card-sub">Últimos 7 dias · o mesmo anúncio em públicos diferentes aparece somado</span></div></div>
+          <div class="ads-grid" id="pd-ads"></div>
         </section>
         <section class="card">
           <div class="card-h"><span class="ico"><svg viewBox="0 0 24 24"><path d="M3 5h18l-7 8v6l-4-2v-4z"/></svg></span><div><h2>Do anúncio ao lead</h2></div></div>
@@ -765,7 +771,8 @@ function renderVG(){
   $('#vg-chart-sub').textContent = (isAll?'Todos os empreendimentos':e.label)+' · '+fRange(V.days[0],V.days[V.days.length-1])+(V.sel?' · faixa destacada = período escolhido':'');
   $('#news').classList.toggle('off', !isAll);
   $$('.vg-all').forEach(x=>x.hidden=!isAll);
-  $('#ads').hidden = !(isAll && vgPeriod==='cur' && (M.topAds||[]).length);
+  $('#ads').hidden = !M.adsByCampaign && !(isAll && vgPeriod==='cur');
+  renderAds(e);
   if (isAll){ renderRank(); renderWho(); renderEng(); }
 }
 function renderSaldo(){
@@ -795,16 +802,34 @@ function renderRank(all=rankAll){ rankAll=all;
   $$('#rank button').forEach(b=>b.addEventListener('click',()=>{ const p=byId[b.dataset.id]; if (p.ended){ vgProduct=p.id; $('#vg-product').value=p.id; renderVG(); scrollTo({top:0,behavior:'smooth'}); } else openProduct(p.id); }));
   $('#rank-more').hidden=all||list.length<=8; $('#rank-more').innerHTML='Ver todos os '+list.length+' empreendimentos <span aria-hidden="true">→</span>';
 }
-function renderAds(){
+/* anúncios de um conjunto de campanhas: junta as listas por campanha e ordena por leads */
+function adsFor(camps, key){
+  const by=(M.adsByCampaign||{})[key]||{};
+  return camps.flatMap(c=>by[c]||[]).sort((a,b)=>b.leads-a.leads||a.spend-b.spend);
+}
+function adsHTML(list, showProd){
   const lab=c=>{ const p=ents.find(x=>x.campaign===c); return p?p.label:prettyName(c); };
-  $('#ads-grid').innerHTML=(M.topAds||[]).map((a,i)=>{ const vid=/ - VID - /i.test(a.name), title=a.name.replace(/^\d+\s*-\s*(VID|IMG)\s*-\s*/i,'');
+  return list.map((a,i)=>{ const vid=/ - VID - /i.test(a.name), title=a.name.replace(/^\d+\s*-\s*(VID|IMG)\s*-\s*/i,'');
     const icon=`<svg viewBox="0 0 24 24" aria-hidden="true">${vid?'<path d="M8 5.5v13l10.5-6.5z"/>':'<rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M20.5 16l-5-5-8 8"/>'}</svg>`;
     const img=a.thumb?`<img src="${esc(a.thumb)}" alt="" loading="lazy" onerror="this.remove();this.parentNode&&this.parentNode.classList.remove('has-img')">`:'';
     return `<article class="ad">
       <div class="ad-thumb ${vid?'vid':'img'} ${a.thumb?'has-img':''}">${icon}${img}<span class="ad-rank">${i+1}º</span><span class="ad-type">${vid?'Vídeo':'Imagem'}</span></div>
-      <div class="ad-body"><span class="ad-prod">${esc(lab(a.campaign))}</span><h3>${esc(title)}</h3>
-        <div class="ad-nums"><span><b>${a.leads}</b> leads</span><span><b>${brl(a.spend/a.leads,2)}</b> por lead</span></div>
+      <div class="ad-body">${showProd?`<span class="ad-prod">${esc(lab(a.campaign))}</span>`:''}<h3>${esc(title)}</h3>
+        <div class="ad-nums"><span><b>${a.leads}</b> ${a.leads===1?'lead':'leads'}</span><span><b>${brl(a.spend/a.leads,2)}</b> por lead</span></div>
         ${a.link?`<a class="ad-link" href="${esc(a.link)}" target="_blank" rel="noopener">Ver anúncio <span aria-hidden="true">↗</span></a>`:''}</div></article>`; }).join('');
+}
+const EMPTY_ADS='<p class="empty ads-empty">Ainda sem criativos com leads neste período.</p>';
+function renderAds(e){
+  const isAll=!e||e.id==='all', key=vgPeriod==='month'?'month':'last7';
+  const when=key==='month'?`${cap1(monthName(MON[0]))}, até ontem`:'Últimos 7 dias'+(vgPeriod==='custom'?' (ranking fixo do Meta)':'');
+  $('#ads-sub').textContent=when+' · o mesmo anúncio em públicos diferentes aparece somado';
+  if (isAll && key==='last7'){
+    $('#ads-h').textContent='Anúncios que mais trouxeram leads';
+    $('#ads-grid').innerHTML=adsHTML(M.topAds||[], true)||EMPTY_ADS; return;
+  }
+  const list = isAll ? adsFor(Object.keys((M.adsByCampaign||{})[key]||{}), key) : adsFor(e.camps, key);
+  $('#ads-h').textContent=isAll?'Anúncios que mais trouxeram leads':'Anúncios de '+e.label;
+  $('#ads-grid').innerHTML=adsHTML(list.slice(0,6), isAll)||EMPTY_ADS;
 }
 const GENDER={ female:'Feminino', male:'Masculino', unknown:'Não informado' };
 function renderWho(){
@@ -843,6 +868,7 @@ function renderProdDetail(){
   if (!cmpOn) ['#pd-leads-d','#pd-spend-d','#pd-cpl-d'].forEach(s=>$(s).innerHTML='');
   lineChart($('#pd-chart'), p.daily, { sel:[7,13], days:ACC.days14, spend:ser(p.camps,ACC.days14,0) });
   $('#pd-chart-sub').textContent=fRange(ACC.days14[0],ACC.days14[13])+' · faixa destacada = últimos 7 dias';
+  $('#pd-ads').innerHTML=adsHTML(adsFor(p.camps,'last7').slice(0,3), false)||EMPTY_ADS;
   $('#pd-f-impr').textContent=int(m.impr); $('#pd-f-clicks').textContent=int(m.clicks); $('#pd-f-leads').textContent=int(m.leads);
   $('#pd-f-p1').textContent=m.impr?pct2(m.clicks/m.impr)+' clicaram':''; $('#pd-f-p2').textContent=m.clicks?pct2(m.leads/m.clicks)+' viraram lead':'';
 }

@@ -13,7 +13,8 @@ Formato de saída (lido pelo index.html):
   "breakdown": {"last7"|"month": {"gender": {...}, "age": {...}}},      # leads, conta inteira
   "engagement": {"last7"|"month": {"spend", "impr", "reach", "videoViews", "reactions"}},
   "budgets": {"<campanha>": {"type": "CBO"|"ABO", "daily": reais, "adsets": n}},
-  "topAds": [{"campaign", "name", "leads", "spend", "link", "thumb"}]   # últimos 7 dias
+  "topAds": [{"campaign", "name", "leads", "spend", "link", "thumb"}],  # últimos 7 dias, conta inteira
+  "adsByCampaign": {"last7"|"month": {"<campanha>": [mesmo formato de topAds]}}  # melhores de cada campanha
 }
 """
 import glob
@@ -34,6 +35,7 @@ LEAD_FIELD = "actions_onsite_conversion_lead_grouped"
 ENGAGEMENT_CAMPAIGN = "[LUZIAC] Engajamento"
 START_DATE = "2026-01-01"       # primeiro dia da série diária (período personalizado)
 TOP_ADS = 6
+TOP_ADS_PER_CAMPAIGN = 6   # o painel junta as campanhas de cada empreendimento
 TZ = timezone(timedelta(hours=-3))  # America/Sao_Paulo
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 OUT = os.path.join(ROOT, "metrics.json")
@@ -165,9 +167,10 @@ def main() -> int:
         acc_rows = windsor(api_key, ["account_name", "spend_cap", "amount_spent", "account_balance"],
                            recent_from, today_s)
 
-        ad_rows = windsor(api_key, ["campaign", "ad_id", "ad_name", "thumbnail_url",
-                                    "ad_preview_shareable_link", "spend", LEAD_FIELD],
-                          last7[0], last7[1])
+        ad_fields = ["campaign", "ad_id", "ad_name", "thumbnail_url",
+                     "ad_preview_shareable_link", "spend", LEAD_FIELD]
+        ad_rows = {"last7": windsor(api_key, ad_fields, last7[0], last7[1]),
+                   "month": windsor(api_key, ad_fields, month[0], month[1])}
     except WindsorError as e:
         print(f"::error::ERRO Windsor {e}")
         return 1
@@ -219,30 +222,43 @@ def main() -> int:
     }
 
     # ---- anúncios que mais trouxeram leads (mesmo anúncio em vários conjuntos = somado) ----
-    ads = {}
-    for r in ad_rows:
-        c, name = r.get("campaign"), r.get("ad_name")
-        if not c or not name:
-            continue
-        a = ads.setdefault((c, name), {"campaign": c, "name": name, "leads": 0, "spend": 0.0,
-                                       "_best": -1, "link": None, "_thumb": None, "_id": None})
-        sp, ld = n(r.get("spend")), int(n(r.get(LEAD_FIELD)))
-        a["leads"] += ld
-        a["spend"] += sp
-        if sp > a["_best"]:
-            a["_best"] = sp
-            a["link"] = r.get("ad_preview_shareable_link") or a["link"]
-            a["_thumb"] = r.get("thumbnail_url") or a["_thumb"]
-            a["_id"] = r.get("ad_id")
-    ranked = sorted((a for a in ads.values() if a["leads"] > 0), key=lambda a: (-a["leads"], a["spend"]))[:TOP_ADS]
-    top_ads, keep_files = [], set()
-    for a in ranked:
+    def group_ads(rows):
+        ads = {}
+        for r in rows:
+            c, name = r.get("campaign"), r.get("ad_name")
+            if not c or not name:
+                continue
+            a = ads.setdefault((c, name), {"campaign": c, "name": name, "leads": 0, "spend": 0.0,
+                                           "_best": -1, "link": None, "_thumb": None, "_id": None})
+            sp, ld = n(r.get("spend")), int(n(r.get(LEAD_FIELD)))
+            a["leads"] += ld
+            a["spend"] += sp
+            if sp > a["_best"]:
+                a["_best"] = sp
+                a["link"] = r.get("ad_preview_shareable_link") or a["link"]
+                a["_thumb"] = r.get("thumbnail_url") or a["_thumb"]
+                a["_id"] = r.get("ad_id")
+        return [a for a in ads.values() if a["leads"] > 0]
+
+    keep_files = set()
+
+    def publish(a):
         thumb = save_thumb(a["_thumb"], a["_id"] or (a["campaign"] + a["name"]))
         if thumb:
             keep_files.add(os.path.basename(thumb))
-        top_ads.append({"campaign": a["campaign"], "name": a["name"], "leads": a["leads"],
-                        "spend": round(a["spend"], 2), "link": a["link"], "thumb": thumb})
-    # apaga miniaturas que saíram do ranking
+        return {"campaign": a["campaign"], "name": a["name"], "leads": a["leads"],
+                "spend": round(a["spend"], 2), "link": a["link"], "thumb": thumb}
+
+    rank = lambda xs: sorted(xs, key=lambda a: (-a["leads"], a["spend"]))
+    top_ads = [publish(a) for a in rank(group_ads(ad_rows["last7"]))[:TOP_ADS]]
+    ads_by_campaign = {}
+    for key, rows in ad_rows.items():
+        per = defaultdict(list)
+        for a in group_ads(rows):
+            per[a["campaign"]].append(a)
+        ads_by_campaign[key] = {c: [publish(a) for a in rank(xs)[:TOP_ADS_PER_CAMPAIGN]]
+                                for c, xs in per.items()}
+    # apaga miniaturas que saíram dos rankings
     for f in glob.glob(os.path.join(ADS_DIR, "*")):
         if os.path.basename(f) not in keep_files:
             os.remove(f)
@@ -257,6 +273,7 @@ def main() -> int:
         "engagement": engagement,
         "budgets": budgets,
         "topAds": top_ads,
+        "adsByCampaign": ads_by_campaign,
     }
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
