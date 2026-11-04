@@ -1,21 +1,23 @@
 """Busca os dados de Meta Ads da conta Lopes Diálogo no Windsor.ai e grava em metrics.json.
 
-Roda no GitHub Actions (ver .github/workflows/atualizar-dados.yml).
+Roda no GitHub Actions (ver .github/workflows/atualizar-dados.yml), de hora em hora.
 A chave da API vem do secret WINDSOR_API_KEY — nunca coloque a chave no código.
 
 Formato de saída (lido pelo index.html):
 {
-  "updatedAt": "...",
-  "campaigns": {
-    "<nome da campanha>": {
-      "campaign": "...",
-      "daily": [{"d","spend","impr","clicks","leads","reach"}, ...],   # desde 01/01/2026
-      "breakdown": {"last7": {...}, "month": {...}}                     # leads por gênero/idade/plataforma/dispositivo
-    }
-  }
+  "updatedAt": "2026-11-04T14:07:00Z",      # UTC
+  "today": "2026-11-04",                     # data de hoje em São Paulo
+  "account": {"name", "spendCap", "amountSpent", "balance"},   # em reais
+  "daily": {"<campanha>": {"AAAA-MM-DD": [spend, impr, clicks, leads], ...}},
+  "reach": {"last7"|"prev7"|"month": {"account": n, "campaigns": {"<campanha>": n}}},
+  "breakdown": {"last7"|"month": {"gender": {...}, "age": {...}}},      # leads, conta inteira
+  "engagement": {"last7"|"month": {"spend", "impr", "reach", "videoViews", "reactions"}},
+  "budgets": {"<campanha>": {"type": "CBO"|"ABO", "daily": reais, "adsets": n}},
+  "topAds": [{"campaign", "name", "leads", "spend", "link", "thumb"}]   # últimos 7 dias
 }
-O index.html liga cada produto (PRODUCTS) à sua campanha pelo nome exato.
 """
+import glob
+import hashlib
 import json
 import os
 import sys
@@ -26,12 +28,16 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 ACCOUNT_ID = "129584587555584"  # Diálogo Engenharia e Construção (Meta Ads)
-# Lead = "Leads (formulário)" do Gerenciador de Anúncios (formulário instantâneo/Messenger
-# dentro do Facebook/Instagram). NÃO inclui leads do pixel do site, para bater com o Meta.
+# Lead = "Leads (formulário)" do Gerenciador de Anúncios. NÃO usar actions_lead
+# (soma os leads do pixel do site e não bate com o Gerenciador).
 LEAD_FIELD = "actions_onsite_conversion_lead_grouped"
-START_DATE = "2026-01-01"       # início do acompanhamento de verba
+ENGAGEMENT_CAMPAIGN = "[LUZIAC] Engajamento"
+START_DATE = "2026-01-01"       # primeiro dia da série diária (período personalizado)
+TOP_ADS = 6
 TZ = timezone(timedelta(hours=-3))  # America/Sao_Paulo
-OUT = os.path.join(os.path.dirname(__file__), "..", "metrics.json")
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+OUT = os.path.join(ROOT, "metrics.json")
+ADS_DIR = os.path.join(ROOT, "assets", "ads")
 
 
 class WindsorError(Exception):
@@ -68,6 +74,34 @@ def n(v):
         return 0.0
 
 
+def save_thumb(url, key):
+    """Baixa a miniatura do anúncio para assets/ads (o link do Meta expira em poucos dias)."""
+    if not url:
+        return None
+    name = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    existing = glob.glob(os.path.join(ADS_DIR, name + ".*"))
+    if existing:
+        return "assets/ads/" + os.path.basename(existing[0])
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (painel)"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+            data = resp.read()
+    except Exception as e:
+        print(f"::warning::miniatura não baixada ({key}): {type(e).__name__}")
+        return None
+    ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/avif": "avif",
+           "image/gif": "gif"}.get(ctype)
+    if not ext:
+        path = urllib.parse.urlparse(url).path.lower()
+        ext = next((e for e in ("jpg", "jpeg", "png", "webp", "avif", "gif") if path.endswith("." + e)), "jpg")
+    os.makedirs(ADS_DIR, exist_ok=True)
+    fn = f"{name}.{ext}"
+    with open(os.path.join(ADS_DIR, fn), "wb") as f:
+        f.write(data)
+    return "assets/ads/" + fn
+
+
 def main() -> int:
     api_key = (os.environ.get("WINDSOR_API_KEY") or "").strip()
     if not api_key:
@@ -75,33 +109,65 @@ def main() -> int:
         return 1
 
     today = datetime.now(TZ).date()
+    yesterday = today - timedelta(days=1)
     # "Últimos 7 dias" igual ao Meta: 7 dias completos, de ontem para trás (sem hoje)
-    last7_from = (today - timedelta(days=7)).isoformat()
-    last7_to = (today - timedelta(days=1)).isoformat()
-    month_from = today.replace(day=1).isoformat()
+    last7 = ((today - timedelta(days=7)).isoformat(), yesterday.isoformat())
+    prev7 = ((today - timedelta(days=14)).isoformat(), (today - timedelta(days=8)).isoformat())
+    # "Este mês": do dia 1 até ontem (no dia 1, mostra o mês anterior inteiro)
+    month = (yesterday.replace(day=1).isoformat(), yesterday.isoformat())
     today_s = today.isoformat()
+    recent_from = (today - timedelta(days=2)).isoformat()
 
     try:
         daily_rows = windsor(api_key,
-            ["date", "campaign", "spend", "impressions", "link_clicks", LEAD_FIELD, "reach"],
+            ["date", "campaign", "spend", "impressions", "link_clicks", LEAD_FIELD],
             START_DATE, today_s)
-        bd = {}
-        # Alcance não pode ser somado dia a dia (a mesma pessoa conta 1x no período),
-        # então busca o alcance já consolidado pelo Meta para cada período.
+
+        # Alcance não pode ser somado dia a dia: busca o consolidado do Meta por período.
         reach = {}
-        periods = (("last7", last7_from, last7_to), ("month", month_from, today_s))
-        for key, frm, to in periods:
+        for key, (frm, to) in (("last7", last7), ("prev7", prev7), ("month", month)):
             acc_rows = windsor(api_key, ["account_name", "reach"], frm, to)
             camp_rows = windsor(api_key, ["campaign", "reach"], frm, to)
             reach[key] = {
                 "account": int(sum(n(r.get("reach")) for r in acc_rows)),
                 "campaigns": {r["campaign"]: int(n(r.get("reach"))) for r in camp_rows if r.get("campaign")},
             }
-        for key, frm, to in periods:
-            bd[key] = (
-                windsor(api_key, ["campaign", "gender", "age", LEAD_FIELD], frm, to),
-                windsor(api_key, ["campaign", "publisher_platform", "device_platform", LEAD_FIELD], frm, to),
-            )
+
+        breakdown = {}
+        for key, (frm, to) in (("last7", last7), ("month", month)):
+            rows = windsor(api_key, ["gender", "age", LEAD_FIELD], frm, to)
+            g, a = defaultdict(int), defaultdict(int)
+            for r in rows:
+                leads = int(n(r.get(LEAD_FIELD)))
+                g[r.get("gender") or "unknown"] += leads
+                a[r.get("age") or "unknown"] += leads
+            breakdown[key] = {"gender": dict(g), "age": dict(a)}
+
+        engagement = {}
+        for key, (frm, to) in (("last7", last7), ("month", month)):
+            rows = windsor(api_key, ["campaign", "spend", "impressions", "actions_video_view",
+                                     "actions_post_reaction"], frm, to)
+            rows = [r for r in rows if r.get("campaign") == ENGAGEMENT_CAMPAIGN]
+            engagement[key] = {
+                "spend": round(sum(n(r.get("spend")) for r in rows), 2),
+                "impr": int(sum(n(r.get("impressions")) for r in rows)),
+                "videoViews": int(sum(n(r.get("actions_video_view")) for r in rows)),
+                "reactions": int(sum(n(r.get("actions_post_reaction")) for r in rows)),
+                "reach": reach[key]["campaigns"].get(ENGAGEMENT_CAMPAIGN, 0),
+            }
+
+        # Orçamento diário atual. Valores do Meta vêm em centavos.
+        # CBO = orçamento da campanha; ABO = soma dos conjuntos ativos.
+        bud_rows = windsor(api_key, ["campaign", "campaign_effective_status", "campaign_daily_budget",
+                                     "adset_id", "adset_effective_status", "adset_daily_budget"],
+                           recent_from, today_s)
+
+        acc_rows = windsor(api_key, ["account_name", "spend_cap", "amount_spent", "account_balance"],
+                           recent_from, today_s)
+
+        ad_rows = windsor(api_key, ["campaign", "ad_id", "ad_name", "thumbnail_url",
+                                    "ad_preview_shareable_link", "spend", LEAD_FIELD],
+                          last7[0], last7[1])
     except WindsorError as e:
         print(f"::error::ERRO Windsor {e}")
         return 1
@@ -111,62 +177,90 @@ def main() -> int:
         print("Windsor retornou 0 linhas; mantendo metrics.json anterior")
         return 0
 
-    # ---- série diária por campanha ----
-    daily = defaultdict(lambda: defaultdict(lambda: {"spend": 0.0, "impr": 0, "clicks": 0, "leads": 0, "reach": 0}))
+    # ---- série diária por campanha: [investimento, impressões, cliques no link, leads] ----
+    daily = defaultdict(lambda: defaultdict(lambda: [0.0, 0, 0, 0]))
     for r in daily_rows:
         c, d = r.get("campaign"), r.get("date")
         if not c or not d:
             continue
         x = daily[c][d]
-        x["spend"] += n(r.get("spend"))
-        x["impr"] += int(n(r.get("impressions")))
-        x["clicks"] += int(n(r.get("link_clicks")))
-        x["leads"] += int(n(r.get(LEAD_FIELD)))
-        x["reach"] += int(n(r.get("reach")))
-
-    campaigns = {}
+        x[0] += n(r.get("spend"))
+        x[1] += int(n(r.get("impressions")))
+        x[2] += int(n(r.get("link_clicks")))
+        x[3] += int(n(r.get(LEAD_FIELD)))
+    daily_out = {}
     for c, days in daily.items():
-        campaigns[c] = {
-            "campaign": c,
-            "daily": [
-                {"d": d, "spend": round(v["spend"], 2), "impr": v["impr"], "clicks": v["clicks"],
-                 "leads": v["leads"], "reach": v["reach"]}
-                for d, v in sorted(days.items())
-            ],
-            "breakdown": {},
-        }
+        kept = {d: [round(v[0], 2), v[1], v[2], v[3]] for d, v in sorted(days.items()) if any(v)}
+        if kept:
+            daily_out[c] = kept
 
-    # ---- leads por gênero / idade / plataforma / dispositivo ----
-    for key, (ga_rows, pd_rows) in bd.items():
-        acc = defaultdict(lambda: {"gender": defaultdict(int), "age": defaultdict(int),
-                                   "platform": defaultdict(int), "device": defaultdict(int)})
-        for r in ga_rows:
-            c = r.get("campaign")
-            if not c:
-                continue
-            leads = int(n(r.get(LEAD_FIELD)))
-            acc[c]["gender"][r.get("gender") or "unknown"] += leads
-            acc[c]["age"][r.get("age") or "unknown"] += leads
-        for r in pd_rows:
-            c = r.get("campaign")
-            if not c:
-                continue
-            leads = int(n(r.get(LEAD_FIELD)))
-            acc[c]["platform"][r.get("publisher_platform") or "unknown"] += leads
-            acc[c]["device"][r.get("device_platform") or "unknown"] += leads
-        for c, dims in acc.items():
-            if c in campaigns:
-                campaigns[c]["breakdown"][key] = {dim: dict(v) for dim, v in dims.items()}
+    # ---- orçamentos ----
+    camp_budget, adset_budget = {}, defaultdict(dict)
+    for r in bud_rows:
+        c = r.get("campaign")
+        if not c or r.get("campaign_effective_status") != "ACTIVE":
+            continue
+        if r.get("campaign_daily_budget") not in (None, "", 0):
+            camp_budget[c] = n(r.get("campaign_daily_budget")) / 100
+        elif r.get("adset_effective_status") == "ACTIVE" and r.get("adset_daily_budget") not in (None, ""):
+            adset_budget[c][r.get("adset_id")] = n(r.get("adset_daily_budget")) / 100
+    budgets = {c: {"type": "CBO", "daily": round(v, 2), "adsets": 0} for c, v in camp_budget.items()}
+    for c, sets in adset_budget.items():
+        if c not in budgets and sets:
+            budgets[c] = {"type": "ABO", "daily": round(sum(sets.values()), 2), "adsets": len(sets)}
+
+    # ---- conta: limite de gastos, valor gasto e gasto ainda não cobrado (centavos) ----
+    acc = acc_rows[0] if acc_rows else {}
+    account = {
+        "name": acc.get("account_name") or "Diálogo Engenharia e Construção",
+        "spendCap": round(n(acc.get("spend_cap")) / 100, 2),
+        "amountSpent": round(n(acc.get("amount_spent")) / 100, 2),
+        "balance": round(n(acc.get("account_balance")) / 100, 2),
+    }
+
+    # ---- anúncios que mais trouxeram leads (mesmo anúncio em vários conjuntos = somado) ----
+    ads = {}
+    for r in ad_rows:
+        c, name = r.get("campaign"), r.get("ad_name")
+        if not c or not name:
+            continue
+        a = ads.setdefault((c, name), {"campaign": c, "name": name, "leads": 0, "spend": 0.0,
+                                       "_best": -1, "link": None, "_thumb": None, "_id": None})
+        sp, ld = n(r.get("spend")), int(n(r.get(LEAD_FIELD)))
+        a["leads"] += ld
+        a["spend"] += sp
+        if sp > a["_best"]:
+            a["_best"] = sp
+            a["link"] = r.get("ad_preview_shareable_link") or a["link"]
+            a["_thumb"] = r.get("thumbnail_url") or a["_thumb"]
+            a["_id"] = r.get("ad_id")
+    ranked = sorted((a for a in ads.values() if a["leads"] > 0), key=lambda a: (-a["leads"], a["spend"]))[:TOP_ADS]
+    top_ads, keep_files = [], set()
+    for a in ranked:
+        thumb = save_thumb(a["_thumb"], a["_id"] or (a["campaign"] + a["name"]))
+        if thumb:
+            keep_files.add(os.path.basename(thumb))
+        top_ads.append({"campaign": a["campaign"], "name": a["name"], "leads": a["leads"],
+                        "spend": round(a["spend"], 2), "link": a["link"], "thumb": thumb})
+    # apaga miniaturas que saíram do ranking
+    for f in glob.glob(os.path.join(ADS_DIR, "*")):
+        if os.path.basename(f) not in keep_files:
+            os.remove(f)
 
     out = {
         "updatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        "account": "Lopes Diálogo",
-        "campaigns": campaigns,
+        "today": today_s,
+        "account": account,
+        "daily": daily_out,
         "reach": reach,
+        "breakdown": breakdown,
+        "engagement": engagement,
+        "budgets": budgets,
+        "topAds": top_ads,
     }
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
-    print(f"{len(daily_rows)} linhas diárias, {len(campaigns)} campanhas gravadas em metrics.json")
+    print(f"{len(daily_rows)} linhas diárias, {len(daily_out)} campanhas, {len(top_ads)} anúncios em metrics.json")
     return 0
 
 

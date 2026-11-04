@@ -27,14 +27,15 @@ jobs:
           WINDSOR_API_KEY: ${{ secrets.WINDSOR_API_KEY }}
         run: python scripts/fetch_windsor.py
 
-      - name: Commitar data.json se mudou
+      - name: Commitar dados se mudaram
         run: |
           git config user.name "painel-bot"
           git config user.email "painel-bot@users.noreply.github.com"
-          git add metrics.json
+          git add -A metrics.json assets/
           if git diff --cached --quiet; then
             echo "Sem mudanças nos dados."
           else
             git commit -m "Atualiza dados do Windsor.ai"
+            git pull --rebase
             git push
           fi
