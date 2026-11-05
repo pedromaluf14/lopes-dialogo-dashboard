@@ -168,7 +168,7 @@ def main() -> int:
                            recent_from, today_s)
 
         ad_fields = ["campaign", "ad_id", "ad_name", "thumbnail_url",
-                     "ad_preview_shareable_link", "spend", LEAD_FIELD]
+                     "ad_preview_shareable_link", "instagram_permalink_url", "spend", LEAD_FIELD]
         ad_rows = {"last7": windsor(api_key, ad_fields, last7[0], last7[1]),
                    "month": windsor(api_key, ad_fields, month[0], month[1])}
     except WindsorError as e:
@@ -229,13 +229,14 @@ def main() -> int:
             if not c or not name:
                 continue
             a = ads.setdefault((c, name), {"campaign": c, "name": name, "leads": 0, "spend": 0.0,
-                                           "_best": -1, "link": None, "_thumb": None, "_id": None})
+                                           "_best": -1, "link": None, "ig": None, "_thumb": None, "_id": None})
             sp, ld = n(r.get("spend")), int(n(r.get(LEAD_FIELD)))
             a["leads"] += ld
             a["spend"] += sp
             if sp > a["_best"]:
                 a["_best"] = sp
                 a["link"] = r.get("ad_preview_shareable_link") or a["link"]
+                a["ig"] = r.get("instagram_permalink_url") or a["ig"]  # post do Instagram: o painel toca o vídeo
                 a["_thumb"] = r.get("thumbnail_url") or a["_thumb"]
                 a["_id"] = r.get("ad_id")
         return [a for a in ads.values() if a["leads"] > 0]
@@ -247,7 +248,7 @@ def main() -> int:
         if thumb:
             keep_files.add(os.path.basename(thumb))
         return {"campaign": a["campaign"], "name": a["name"], "leads": a["leads"],
-                "spend": round(a["spend"], 2), "link": a["link"], "thumb": thumb}
+                "spend": round(a["spend"], 2), "link": a["link"], "ig": a["ig"], "thumb": thumb}
 
     rank = lambda xs: sorted(xs, key=lambda a: (-a["leads"], a["spend"]))
     top_ads = [publish(a) for a in rank(group_ads(ad_rows["last7"]))[:TOP_ADS]]
